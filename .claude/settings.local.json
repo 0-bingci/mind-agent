@@ -5,7 +5,17 @@
       "Bash(npx drizzle-kit:*)",
       "Bash(pnpm add:*)",
       "Bash(grep -r match_notes /d/University/code/mind-agent --include=*.json --include=*.ts --include=*.tsx)",
-      "Bash(find /d/University/code/mind-agent -type f -name README.md -o -name CLAUDE.md -o -name .claude* -o -name next.config.* -o -name drizzle.config.*)"
+      "Bash(find /d/University/code/mind-agent -type f -name README.md -o -name CLAUDE.md -o -name .claude* -o -name next.config.* -o -name drizzle.config.*)",
+      "Bash(git log:*)",
+      "Bash(xargs grep:*)",
+      "Bash(grep -r ImageGenerationTool /d/University/code/mind-agent/node_modules --include=*.d.ts)",
+      "Bash(find /d/University/code/mind-agent -type f \\\\\\( -name \"*.ts\" -o -name \"*.tsx\" -o -name \"*.js\" -o -name \"*.jsx\" \\\\\\) ! -path \"*/node_modules/*\" ! -path \"*/.next/*\" ! -path \"*/.git/*\" -exec wc -l {} +)",
+      "Bash(xargs wc:*)",
+      "Bash(grep -r \"MindMap\\\\|generateMindMap\\\\|saveMindMap\\\\|mindmapCode\" /d/University/code/mind-agent/app --include=*.ts --include=*.tsx)",
+      "Bash(grep -r \"MindMap\\\\|generateMindMap\\\\|saveMindMap\\\\|mindmapCode\" /d/University/code/mind-agent/components --include=*.ts --include=*.tsx)",
+      "Bash(npm install:*)",
+      "Bash(pnpm remove:*)",
+      "Bash(npx next:*)"
     ]
   }
 }
