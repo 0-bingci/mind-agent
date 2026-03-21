@@ -1,0 +1,11 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(find /d/University/code/mind-agent -maxdepth 2 -name *.mjs -o -name *.config.*)",
+      "Bash(npx drizzle-kit:*)",
+      "Bash(pnpm add:*)",
+      "Bash(grep -r match_notes /d/University/code/mind-agent --include=*.json --include=*.ts --include=*.tsx)",
+      "Bash(find /d/University/code/mind-agent -type f -name README.md -o -name CLAUDE.md -o -name .claude* -o -name next.config.* -o -name drizzle.config.*)"
+    ]
+  }
+}

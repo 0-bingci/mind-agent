@@ -5,10 +5,12 @@ import { SupabaseVectorStore } from "@langchain/community/vectorstores/supabase"
 import { createAgent } from "langchain";
 import { z } from "zod";
 import { llm, embeddings } from "./ai";
-import { DynamicTool, tool } from "@langchain/core/tools";
-import { MemorySaver } from "@langchain/langgraph";
-import { HumanMessage, AIMessage, SystemMessage, BaseMessage } from "@langchain/core/messages";
+import { tool } from "@langchain/core/tools";
+import { HumanMessage, AIMessage, BaseMessage } from "@langchain/core/messages";
 import { TavilySearchAPIWrapper, TavilyExtractAPIWrapper } from "@langchain/tavily";
+import { db } from "@/db";
+import { chatLogs, traceSpans } from "@/db/schema";
+import { getActivePrompt } from "./prompt";
 
 // 初始化 Wrapper
 const searchWrapper = new TavilySearchAPIWrapper({
@@ -17,8 +19,6 @@ const searchWrapper = new TavilySearchAPIWrapper({
 const extractWrapper = new TavilyExtractAPIWrapper({
   tavilyApiKey: process.env.TAVILY_API_KEY!,
 });
-
-const checkpointer = new MemorySaver();
 
 const searchWebTool = tool(
   async ({ query, depth = "basic" }) => {
@@ -87,13 +87,72 @@ const webExtractTool = tool(
 // 这种写法能更清晰地向模型描述 Schema
 const searchNotesTool = tool(
   async ({ query }) => {
-    const vectorStore = new SupabaseVectorStore(embeddings, {
-      client: supabaseClient,
-      tableName: "notes",
-      queryName: "match_notes",
-    });
-    const docs = await vectorStore.similaritySearch(query, 3);
-    return docs.map(d => `标题: ${d.metadata.title}\n内容: ${d.pageContent}`).join("\n\n");
+    const allResults: { title: string; content: string; score: number; source: string }[] = [];
+
+    // 1. 向量语义搜索
+    try {
+      const vectorStore = new SupabaseVectorStore(embeddings, {
+        client: supabaseClient,
+        tableName: "notes",
+        queryName: "match_notes",
+      });
+      const vectorResults = await vectorStore.similaritySearchWithScore(query, 5);
+      console.log("[SEARCH_NOTES] 向量搜索结果:", vectorResults.map(([d, s]) => ({
+        title: d.metadata.title,
+        score: s,
+        contentPreview: d.pageContent?.substring(0, 80),
+      })));
+
+      for (const [doc, score] of vectorResults) {
+        // SupabaseVectorStore 返回的 score 是相似度（越大越好），阈值降到 0.3
+        if (score > 0.3) {
+          allResults.push({
+            title: doc.metadata.title,
+            content: doc.pageContent,
+            score,
+            source: "向量搜索",
+          });
+        }
+      }
+    } catch (err) {
+      console.error("[SEARCH_NOTES] 向量搜索失败:", err);
+    }
+
+    // 2. 关键词全文搜索（兜底）
+    try {
+      const { data: keywordResults } = await supabaseClient
+        .from("notes")
+        .select("id, title, content")
+        .or(`title.ilike.%${query}%,content.ilike.%${query}%`)
+        .limit(5);
+
+      if (keywordResults) {
+        console.log("[SEARCH_NOTES] 关键词搜索命中:", keywordResults.map(n => n.title));
+        for (const note of keywordResults) {
+          // 去重：如果向量搜索已经找到同一篇笔记，跳过
+          if (!allResults.some(r => r.title === note.title)) {
+            allResults.push({
+              title: note.title,
+              content: note.content || "",
+              score: 0.5, // 关键词匹配给一个中等分数
+              source: "关键词匹配",
+            });
+          }
+        }
+      }
+    } catch (err) {
+      console.error("[SEARCH_NOTES] 关键词搜索失败:", err);
+    }
+
+    if (allResults.length === 0) {
+      return `[无匹配结果] 用户笔记库中没有找到与"${query}"相关的内容。请不要编造笔记内容，应如实告知用户未找到。`;
+    }
+
+    // 按分数排序，返回结果
+    allResults.sort((a, b) => b.score - a.score);
+    return allResults
+      .map(r => `[${r.source} | 相似度: ${r.score.toFixed(2)}] 标题: ${r.title}\n内容: ${r.content}`)
+      .join("\n\n");
   },
   {
     name: "search_notes",
@@ -135,36 +194,98 @@ const instructions = `## 角色定位
 - **拒绝复读**：严禁直接输出搜索结果的原始片段。你必须根据 [CONTENT] 标签整理出逻辑清晰的结论。
 - **冲突处理**：当“网页信息”与“用户笔记”冲突时，必须在回复中指出：“在您的笔记中记录为 A，但目前网络公认信息为 B，我建议以...为准。”
 
+## 信源标注（强制）
+- 你输出的每一个事实性陈述，必须标注来源：[笔记] 或 [网络: URL] 或 [常识]。
+- 如果某信息无法标注来源，你必须明确说明"这是我的推测，未经验证"。
+- 严禁混淆来源：不要把网络搜到的内容说成"你的笔记里记录了"。
+- 如果 search_notes 返回"[无匹配结果]"，你必须如实告知用户笔记中没有相关内容，严禁编造笔记内容。
+
 ## 强制约束
 - 如果第一次搜索结果不理想，你**必须**进行至少第二次不同角度的搜索尝试。
 - 在输出最终答案前，检查是否满足了用户所有的潜在需求（如：不仅找到了软件，还确认了它的图标特征）。
 `;
 
-// 在模块级别维护会话历史（生产环境建议存 Redis/DB）
-const sessionHistories = new Map<string, BaseMessage[]>();
+export async function askAgent(
+  userInput: string,
+  clientHistory: { role: string; content: string }[] = [],
+  sessionId?: string
+) {
+  // 从 DB 读取激活的 prompt，没有则 fallback 到硬编码版本
+  const { content: activePrompt } = await getActivePrompt();
+  const systemPrompt = activePrompt || instructions;
 
-export async function askAgent(userInput: string, threadId: string = "default-user") {
-
-  // ✅ 不传 checkpointer，完全手动管理
   const agent = createAgent({
     model: llm,
     tools: [searchNotesTool, searchWebTool, webExtractTool],
-    systemPrompt: instructions,
-    // checkpointer: checkpointer,  ← 删掉这行
+    systemPrompt,
   });
 
-  // 读取当前会话的历史
-  const history = sessionHistories.get(threadId) || [];
+  // 将客户端传来的历史转换为 LangChain 消息格式
+  const history: BaseMessage[] = clientHistory
+    .filter((m) => m.content)
+    .map((m) =>
+      m.role === "user" ? new HumanMessage(m.content) : new AIMessage(m.content)
+    );
 
   const stream = new TransformStream();
   const writer = stream.writable.getWriter();
   const encoder = new TextEncoder();
 
-  (async () => {
-    try {
-      // 收集本轮产生的新消息，用于回写历史
-      const newMessages: BaseMessage[] = [];
+  // Span 数据结构
+  interface SpanRecord {
+    runId: string;
+    parentRunId: string | null;
+    type: "llm" | "tool" | "chain";
+    name: string;
+    input: unknown;
+    output: unknown;
+    promptTokens: number;
+    completionTokens: number;
+    startedAt: Date;
+    endedAt: Date | null;
+    durationMs: number | null;
+    status: string;
+    errorMessage: string | null;
+  }
 
+  (async () => {
+    const startTime = Date.now();
+    let agentOutput = "";
+    let totalPromptTokens = 0;
+    let totalCompletionTokens = 0;
+    let logStatus = "success";
+    let logError: string | undefined;
+
+    // Span 追踪
+    const spans = new Map<string, SpanRecord>();
+    // 维护一个 chain runId 栈，用于推导 parent
+    const chainStack: string[] = [];
+
+    const getCurrentParent = () =>
+      chainStack.length > 0 ? chainStack[chainStack.length - 1] : null;
+
+    // 安全截断数据，直接存为截断后的字符串，不尝试重新解析
+    const truncate = (data: unknown, maxLen = 5000): unknown => {
+      if (data == null) return null;
+      try {
+        const str = typeof data === "string" ? data : JSON.stringify(data);
+        if (str.length <= maxLen) return data;
+        return str.substring(0, maxLen) + "...(truncated)";
+      } catch {
+        return String(data).substring(0, maxLen);
+      }
+    };
+
+    const safeStringify = (data: unknown, maxLen = 5000): string => {
+      try {
+        const str = typeof data === "string" ? data : JSON.stringify(data);
+        return str.substring(0, maxLen);
+      } catch {
+        return String(data).substring(0, maxLen);
+      }
+    };
+
+    try {
       const eventStream = agent.streamEvents(
         {
           messages: [...history, new HumanMessage(userInput)],
@@ -176,50 +297,183 @@ export async function askAgent(userInput: string, threadId: string = "default-us
       );
 
       for await (const event of eventStream) {
+        // --- Chain 事件 ---
+        if (event.event === "on_chain_start") {
+          spans.set(event.run_id, {
+            runId: event.run_id,
+            parentRunId: getCurrentParent(),
+            type: "chain",
+            name: event.name || "chain",
+            input: truncate(event.data?.input),
+            output: null,
+            promptTokens: 0,
+            completionTokens: 0,
+            startedAt: new Date(),
+            endedAt: null,
+            durationMs: null,
+            status: "success",
+            errorMessage: null,
+          });
+          chainStack.push(event.run_id);
+        }
+
+        if (event.event === "on_chain_end") {
+          const span = spans.get(event.run_id);
+          if (span) {
+            span.endedAt = new Date();
+            span.durationMs = span.endedAt.getTime() - span.startedAt.getTime();
+            span.output = truncate(event.data?.output);
+          }
+          // 从栈中弹出（可能不在栈顶，用 filter 安全移除）
+          const idx = chainStack.lastIndexOf(event.run_id);
+          if (idx !== -1) chainStack.splice(idx, 1);
+        }
+
+        // --- LLM 事件 ---
+        if (event.event === "on_chat_model_start") {
+          // 记录 LLM span，input 包含完整的输入 messages
+          const inputMessages = event.data?.input?.messages;
+          // 将 messages 序列化为可读格式
+          const formattedInput = inputMessages
+            ? (Array.isArray(inputMessages) ? inputMessages : [inputMessages]).flat().map((msg: any) => ({
+                role: msg?.constructor?.name || msg?._getType?.() || "unknown",
+                content: typeof msg?.content === "string"
+                  ? msg.content.substring(0, 2000)
+                  : safeStringify(msg?.content, 2000),
+              }))
+            : null;
+
+          spans.set(event.run_id, {
+            runId: event.run_id,
+            parentRunId: getCurrentParent(),
+            type: "llm",
+            name: event.name || "ChatOpenAI",
+            input: formattedInput,
+            output: null,
+            promptTokens: 0,
+            completionTokens: 0,
+            startedAt: new Date(),
+            endedAt: null,
+            durationMs: null,
+            status: "success",
+            errorMessage: null,
+          });
+        }
+
         if (event.event === "on_chat_model_stream") {
           const content = event.data.chunk?.content;
           if (content && typeof content === "string") {
-            console.log("[STREAM CHUNK]:", content);
+            agentOutput += content;
             await writer.write(encoder.encode(content));
           }
         }
+
         if (event.event === "on_chat_model_end") {
           const output = event.data?.output;
-          console.log("[MODEL FULL OUTPUT]:", JSON.stringify(output, null, 2));
+          const span = spans.get(event.run_id);
+          if (span) {
+            span.endedAt = new Date();
+            span.durationMs = span.endedAt.getTime() - span.startedAt.getTime();
+            // 存储 LLM 输出内容
+            const outputContent = output?.content;
+            span.output = typeof outputContent === "string"
+              ? outputContent.substring(0, 5000)
+              : safeStringify(outputContent, 5000);
+            // Token 用量
+            const usage = output?.usage_metadata;
+            if (usage) {
+              span.promptTokens = usage.input_tokens ?? 0;
+              span.completionTokens = usage.output_tokens ?? 0;
+              totalPromptTokens += span.promptTokens;
+              totalCompletionTokens += span.completionTokens;
+            }
+          }
         }
+
+        // --- Tool 事件 ---
         if (event.event === "on_tool_start") {
-          console.log("[TOOL CALL]:", event.name, JSON.stringify(event.data?.input, null, 2));
+          spans.set(event.run_id, {
+            runId: event.run_id,
+            parentRunId: getCurrentParent(),
+            type: "tool",
+            name: event.name || "tool",
+            input: truncate(event.data?.input),
+            output: null,
+            promptTokens: 0,
+            completionTokens: 0,
+            startedAt: new Date(),
+            endedAt: null,
+            durationMs: null,
+            status: "success",
+            errorMessage: null,
+          });
         }
 
         if (event.event === "on_tool_end") {
-          console.log("[TOOL RESULT]:", event.name, JSON.stringify(event.data?.output, null, 2));
-        }
-
-        // ✅ 捕获最终的 AI 回答消息，用于下轮历史
-        if (event.event === "on_chain_end" && event.name === "agent") {
-          const outputMessages = event.data?.output?.messages as BaseMessage[] | undefined;
-          if (outputMessages) {
-            // 只保留 HumanMessage 和无 tool_calls 的 AIMessage
-            for (const msg of outputMessages) {
-              if (msg instanceof AIMessage && !(msg.tool_calls?.length)) {
-                newMessages.push(msg);
-              }
-            }
+          const span = spans.get(event.run_id);
+          if (span) {
+            span.endedAt = new Date();
+            span.durationMs = span.endedAt.getTime() - span.startedAt.getTime();
+            span.output = safeStringify(event.data?.output, 5000);
           }
         }
       }
 
-      // ✅ 回写历史：旧历史 + 本轮用户输入 + 本轮 AI 最终回答
-      sessionHistories.set(threadId, [
-        ...history,
-        new HumanMessage(userInput),
-        ...newMessages,
-      ]);
-
     } catch (e: any) {
       console.error("Agent error:", e);
+      logStatus = "error";
+      logError = e?.message ?? String(e);
       await writer.write(encoder.encode(`\n\n[系统提示]: 执行遇到错误，请重试。`));
     } finally {
+      // 写入日志和 spans
+      const durationMs = Date.now() - startTime;
+      try {
+        const [{ id: logId }] = await db.insert(chatLogs)
+          .values({
+            sessionId: sessionId ?? null,
+            userInput,
+            agentOutput: agentOutput.substring(0, 10000),
+            promptTokens: totalPromptTokens,
+            completionTokens: totalCompletionTokens,
+            totalTokens: totalPromptTokens + totalCompletionTokens,
+            toolCalls: null, // 不再写入扁平数组，使用 trace_spans
+            durationMs,
+            status: logStatus,
+            errorMessage: logError,
+          })
+          .returning({ id: chatLogs.id });
+
+        // 批量插入 trace spans
+        const spanValues = Array.from(spans.values())
+          .filter((s) => s.type === "llm" || s.type === "tool") // 只保留 llm 和 tool span，chain 太多噪音
+          .map((s) => ({
+            chatLogId: logId,
+            runId: s.runId,
+            parentRunId: s.parentRunId,
+            type: s.type,
+            name: s.name,
+            input: s.input as any,
+            output: s.output as any,
+            promptTokens: s.promptTokens || null,
+            completionTokens: s.completionTokens || null,
+            startedAt: s.startedAt,
+            endedAt: s.endedAt,
+            durationMs: s.durationMs,
+            status: s.status,
+            errorMessage: s.errorMessage,
+          }));
+
+        if (spanValues.length > 0) {
+          await db.insert(traceSpans).values(spanValues);
+        }
+
+        // 在流末尾写入 logId 标记，供前端解析
+        await writer.write(encoder.encode(`\n__LOG_ID__:${logId}`));
+        console.log("[LOG] 日志已保存, logId:", logId, "spans:", spanValues.length);
+      } catch (err) {
+        console.error("[LOG] 日志保存失败:", err);
+      }
+
       await writer.close();
     }
   })();
