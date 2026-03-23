@@ -275,7 +275,12 @@ export function MindMap({ chart }: { chart: string }) {
   useEffect(() => {
     if (!chart) return
     try {
-      const data: MindMapData = JSON.parse(chart)
+      // 兼容 LLM 返回的 markdown 代码块包裹的 JSON
+      let raw = chart.trim()
+      const jsonMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/)
+      if (jsonMatch) raw = jsonMatch[1].trim()
+
+      const data: MindMapData = JSON.parse(raw)
       if (!data.nodes?.length) {
         setError("思维导图数据为空")
         return

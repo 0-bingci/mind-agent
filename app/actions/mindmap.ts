@@ -65,7 +65,21 @@ JSON 结构如下：
 ${markdown.slice(0, 3000)}
   `)
 
-  return result.content as string
+  const raw = (typeof result.content === "string"
+    ? result.content
+    : Array.isArray(result.content)
+      ? result.content.map((c: any) => (typeof c === "string" ? c : c.text ?? "")).join("")
+      : String(result.content)
+  ).trim()
+
+  // 去除 LLM 可能包裹的 markdown 代码块
+  const jsonMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/)
+  const cleaned = jsonMatch ? jsonMatch[1].trim() : raw
+
+  // 验证是合法 JSON
+  JSON.parse(cleaned)
+
+  return cleaned
 }
 
 // 保存到数据库
