@@ -15,7 +15,11 @@
       "Bash(grep -r \"MindMap\\\\|generateMindMap\\\\|saveMindMap\\\\|mindmapCode\" /d/University/code/mind-agent/components --include=*.ts --include=*.tsx)",
       "Bash(npm install:*)",
       "Bash(pnpm remove:*)",
-      "Bash(npx next:*)"
+      "Bash(npx next:*)",
+      "Bash(grep -r \"createAgent\\\\|bindTools\\\\|tool_choice\" /d/University/code/mind-agent/app /d/University/code/mind-agent/lib --include=*.ts --include=*.tsx)",
+      "Bash(grep -r \"askAgent\\\\|search_notes\\\\|searchNotesTool\" /d/University/code/mind-agent --include=*.ts --include=*.tsx -n)",
+      "Bash(curl -sL https://www.gnu.org/licenses/gpl-3.0.txt -o /tmp/gpl3.txt)",
+      "Read(//tmp/**)"
     ]
   }
 }
